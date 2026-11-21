@@ -133,3 +133,138 @@ spotify-full/
 ## License
 
 MIT，见 [LICENSE](LICENSE)。
+
+
+---
+
+## Cookie 模式（网页播放器内部接口后端）
+
+> 本节是后加的第二后端说明。默认后端仍是上面的官方 Web API（OAuth）；
+> 本节内容与前文冲突时，cookie 模式以本节为准。
+
+### 为什么有这个模式
+
+Spotify 在 2026 年 2 月起要求 Development Mode 应用的**所有者持有
+Premium**，否则官方 Web API 返回 403；而且新建应用在歌单内容接口
+（读/加/删歌单曲目）上还有单独一层限制。没有 Premium 时，官方后端
+对歌单操作基本堵死。
+
+但免费账号在官方**网页播放器**里本来就能建歌单、加歌、删歌、排序，
+走的是 Spotify 第一方内部接口。cookie 模式就是用账号自己的登录
+cookie（`sp_dc`）以第一方网页客户端身份调同一套接口：不经过开发者
+应用，不受 Premium 门限制。已在多个活跃开源项目中实证（建/读/加/
+删/**重排**全通），本工具的实现依据是 songmirror 项目 2026 年 7 月
+的端到端实证文档。
+
+### 原理（鉴权链）
+
+1. 凭据文件里的 `sp_dc`（浏览器登录态 cookie，有效期约一年）。
+2. 取服务器时间 → 用网页播放器 JS 内置的共享密钥生成 TOTP（密钥按
+   版本轮换，社区持续从官方 bundle 提取维护；本工具运行时优先从
+   社区仓库 `secretDict.json` 拉取并本地缓存，拉不到用内置版本兜底，
+   当前内置最新为 v61）。
+3. 用 TOTP 向 `open.spotify.com/api/token` 换第一方 access token
+   （约 1 小时有效，只存内存）。
+4. 歌单读写走 Pathfinder GraphQL（`api-partner.spotify.com`）的持久化
+   查询；建歌单走 spclient 通道（见下方限制）。
+
+### 启用与命令
+
+全局参数 `--backend cookie`，或环境变量 `SPOTIFY_FULL_BACKEND=cookie`。
+默认仍是官方后端，两种模式共用同一个凭据文件。
+
+```text
+python3 spotify.py --backend cookie playlist-tracks <歌单id>
+python3 spotify.py --backend cookie playlist-add <歌单id> <uri...> [--position N]
+python3 spotify.py --backend cookie playlist-remove <歌单id> <uri...>
+python3 spotify.py --backend cookie playlist-set-order <歌单id> <uri...>   # 按完整目标顺序重排
+python3 spotify.py --backend cookie playlist-create <名称>                  # spclient 通道，见限制
+python3 spotify.py cookie-login                                             # 自带浏览器登录取 sp_dc
+```
+
+- `playlist-add` 按给出的顺序批量加歌：不带 `--position` 追加到末尾，
+  `--position 0` 插到最前，`--position N` 插到第 N 首之后。加歌后
+  自动回读校验，结果里 `verified` 标明是否与预期一致。
+- `playlist-set-order` 必须给出与歌单现状**同一批曲目**的完整目标
+  顺序（含重复计数），内部用 `moveItemsInPlaylist` 逐条移动，完成后
+  回读校验；数量或曲目对不上会直接报错、不动手。
+- `playlist-remove` 按曲目 uri 删除（同 uri 的多个条目一并删除），
+  内部先读现状把 uri 解析成条目 uid 再删，完成后回读校验。
+- 写操作之间自动间隔 ≥1 秒；单次运行写调用上限默认 50 次
+  （`SPOTIFY_FULL_COOKIE_MAX_WRITES` 可调），超限停下报告。
+- **关键实现细节**：Pathfinder 写操作失败时 HTTP 仍可能返回 200，
+  失败藏在返回节点的 `__typename` 里。本工具每次写操作都检查
+  `__typename` 与 `errors` 数组，失败如实报错，绝不假报成功。
+
+### 获取 sp_dc 的两种方式
+
+**方式一：自带无头浏览器登录（`cookie-login`，可选组件）**
+
+本工具自带一个给 AI 用的无头浏览器登录模块 `browser_login.py`，
+走的是 Yousj 浏览器项目的路线：无头优先、经 CDP 驱动一个真实
+Chromium（标准库最小 WebSocket 实现，无第三方依赖），profile 固定
+放在凭据目录的 `browser-profile/` 下。运行
+`python3 spotify.py cookie-login` 后：
+
+- 若该 profile 的浏览器会话里已有有效登录态，直接提取 `sp_dc`
+  写入凭据文件（600），全程不打印 cookie 值；
+- 若停在账号密码表单、Google 登录、验证器验证码或 CAPTCHA 等
+  需要真人介入的步骤，立即停下并结构化报告需要什么
+  （`status: needs_user_action` + `reason`），绝不乱试；本模块
+  不接收、不保存账号密码。可以先用同一个 profile 开一次有界面
+  Chromium 完成登录，之后无头流程即可直接取 cookie；
+- 本机没有 Chromium 时本模块不可用（`status` 与代码里的 `probe()`
+  会报告），手动填的方式不受影响。
+
+**方式二：手动从浏览器复制**
+
+1. 在浏览器登录 https://open.spotify.com（确认是已登录状态）。
+2. 打开开发者工具（F12）→ 应用/Application → Cookie →
+   `https://open.spotify.com`，找到名为 **`sp_dc`** 的那一行，
+   复制它的值。
+3. 把值填入 `~/.config/spotify-full/credentials.json` 的 `sp_dc`
+   字段（保持文件权限 600）。**绝不要把 sp_dc 发到聊天、issue 或
+   任何日志里**——它等同于完整的浏览器登录态，拿到它的人可以
+   完全控制这个 Spotify 账号；怀疑泄露时立刻在 Spotify 官网退出
+   全部会话/改密码使其失效。
+
+### 能力对照（官方后端 vs cookie 后端）
+
+| 能力 | 官方 OAuth 后端 | cookie 后端 |
+| --- | --- | --- |
+| 前提 | 自己的开发者应用 + 所有者 Premium（2026 新规） | 账号的 sp_dc，无需开发者应用、无需 Premium |
+| 读歌单内容 | ✓（新应用可能被内容接口限制） | ✓ |
+| 加歌/删歌 | ✓（同上） | ✓（含回读校验） |
+| 排序 | 区间 reorder | 完整目标顺序重排（playlist-set-order） |
+| 建歌单 | ✓ 完整 | △ spclient 通道：能建并返回 URI，但暂未归档进曲库列表、不能设描述/公开私密（见下） |
+| 改名/封面/播放/曲库/搜索等 | ✓ | ✗（不在本后端范围，用官方后端） |
+| 歌词（LRCLIB） | 与后端无关，两种模式都能用 | 同左 |
+
+### 限制与风险（如实说明）
+
+- **建歌单是尽力而为**：spclient 建出的歌单能拿到 URI 并可直接
+  加歌/读取，但归档进曲库 rootlist 需要账号 user id，本后端暂未
+  实现解析，所以新歌单暂时不会出现在曲库列表里；返回值里
+  `filed_in_library: false` 会如实标注。
+- **内部接口会漂移**：持久化查询哈希与 TOTP 密钥版本随网页播放器
+  发版轮换。哈希失效时服务端返回 `PersistedQueryNotFound`，本工具
+  会明确报出需要更新哈希；TOTP 密钥靠社区仓库自动跟进 + 本地缓存。
+- **账号级限流**：Spotify 对异常高频调用有账号级惩罚手段，所以本
+  工具强制写间隔与写次数上限；请保持低频、拟人地使用。本后端从不
+  调用 `api.spotify.com`。
+- **条款性质**：使用未公开的内部接口与官方条款存在张力，个人低频
+  自用目前无确证封号案例，但官方也没有任何保证。是否使用由账号
+  所有者自行决定。
+- **部署状态**：cookie 模式代码已实现并通过离线 mock 测试
+  （`tests/test_cookie_client.py`，含 TOTP 已知向量交叉核对、
+  `__typename` 错误拦截、完整重排演算），但**尚未用真实 sp_dc
+  实测**；首次实测后请把结果补记到连接器文档。
+
+### 新增文件
+
+```text
+├── cookie_client.py    cookie 模式后端（TOTP + Pathfinder + spclient 建单）
+├── browser_login.py    自带无头浏览器登录模块（可选，Yousj 浏览器路线）
+└── tests/
+    └── test_cookie_client.py  cookie 模式离线测试（mock，不碰真实账号）
+```

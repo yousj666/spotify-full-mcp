@@ -25,7 +25,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_DIR = os.environ.get(
     "SPOTIFY_FULL_CONFIG_DIR", os.path.expanduser("~/.config/spotify-full"))
 CREDENTIALS_PATH = os.path.join(CONFIG_DIR, "credentials.json")
-PY_FILES = ["spotify.py", "spotify_client.py", "lyrics.py", "listen.py",
+PY_FILES = ["spotify.py", "spotify_client.py", "cookie_client.py",
+            "browser_login.py", "lyrics.py", "listen.py",
             "local_player.py", "setup.py"]
 
 

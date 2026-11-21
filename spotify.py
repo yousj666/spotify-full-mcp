@@ -7,6 +7,19 @@
     auth                      走 OAuth 授权（本地回调 127.0.0.1:8888），令牌落盘
     status                    查看凭据与令牌状态（不调 API）
 
+后端选择（全局参数 --backend 或环境变量 SPOTIFY_FULL_BACKEND，默认 oauth）:
+    oauth                     官方 Web API 后端（spotify_client.py）
+    cookie                    网页播放器内部接口后端（cookie_client.py）：用
+                              sp_dc cookie 以第一方客户端身份操作歌单，
+                              不需要开发者应用与 Premium。此模式下
+                              playlist-tracks / playlist-add /
+                              playlist-remove / playlist-create 走 cookie
+                              后端，另有专属子命令:
+    cookie-login              用自带无头浏览器登录取 sp_dc 并写入凭据文件
+                              （可选组件 browser_login.py，Yousj 浏览器路线）
+    playlist-set-order <歌单id> <uri...>
+                              按给出的完整目标顺序重排歌单（仅 cookie 模式）
+
 搜索与目录:
     search <关键词> [--type track,album,artist,playlist] [--limit N]
     track <id>                album <id>            album-tracks <id>
@@ -54,6 +67,7 @@
 """
 import argparse
 import json
+import os
 import sys
 
 sys.path.insert(0, "/home/hatch/workspace/spotify-full")
@@ -77,10 +91,14 @@ def print_result(result, as_json: bool):
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="spotify.py", description="全功能 Spotify 包装器")
     parser.add_argument("--json", action="store_true", help="以 JSON 输出（歌词默认文本输出）")
+    parser.add_argument("--backend", choices=["oauth", "cookie"], default=None,
+                        help="后端：oauth（默认，官方 Web API）或 cookie（网页播放器"
+                             "内部接口）；也可用环境变量 SPOTIFY_FULL_BACKEND")
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("auth", help="OAuth 授权")
     sub.add_parser("status", help="凭据与令牌状态")
+    sub.add_parser("cookie-login", help="用自带无头浏览器登录取 sp_dc（可选组件）")
 
     p = sub.add_parser("search")
     p.add_argument("query")
@@ -113,6 +131,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("range_start", type=int)
     p.add_argument("insert_before", type=int)
     p.add_argument("--range-length", type=int, default=1)
+
+    p = sub.add_parser("playlist-set-order")
+    p.add_argument("playlist_id")
+    p.add_argument("uris", nargs="+",
+                   help="完整目标顺序的曲目 uri 列表（仅 cookie 模式）")
 
     p = sub.add_parser("playlist-edit")
     p.add_argument("playlist_id")
@@ -309,23 +332,72 @@ def run_client_command(client: SpotifyClient, args):
     raise SpotifyError(f"未知子命令: {cmd}")
 
 
+def run_cookie_command(args):
+    """cookie 模式的歌单子命令分发（cookie_client.CookieClient）。"""
+    from cookie_client import CookieClient
+
+    cmd = args.command
+    supported = ("playlist-tracks", "playlist-add", "playlist-remove",
+                 "playlist-create", "playlist-set-order")
+    if cmd == "playlist-reorder":
+        raise SpotifyError(
+            "cookie 模式不用 playlist-reorder（那是官方后端的区间移动）；"
+            "请用 playlist-set-order 给出完整目标顺序来重排。")
+    if cmd not in supported:
+        raise SpotifyError(
+            f"cookie 模式暂不支持子命令 {cmd}。支持: "
+            + " / ".join(supported)
+            + "，外加 status 与 cookie-login。其余功能请用默认 oauth 后端。")
+    client = CookieClient()
+    if cmd == "playlist-tracks":
+        return client.get_playlist_contents(args.id)
+    if cmd == "playlist-add":
+        return client.add_tracks(args.playlist_id, args.uris,
+                                 position=args.position)
+    if cmd == "playlist-remove":
+        return client.remove_tracks(args.playlist_id, args.uris)
+    if cmd == "playlist-create":
+        return client.create_playlist(args.name)
+    if cmd == "playlist-set-order":
+        return client.reorder_to(args.playlist_id, args.uris)
+    raise SpotifyError(f"未知子命令: {cmd}")
+
+
 def main() -> int:
     args = build_parser().parse_args()
+    backend = args.backend or os.environ.get(
+        "SPOTIFY_FULL_BACKEND", "oauth").strip().lower()
+    if backend not in ("oauth", "cookie"):
+        print(f"错误: 未知后端 {backend!r}（只能是 oauth 或 cookie）")
+        return 1
 
     try:
         if args.command == "status":
             creds = load_credentials()
             info = {
                 "credentials_path": CREDENTIALS_PATH,
+                "backend": backend,
                 "configured": bool(creds.get("client_id") and creds.get("client_secret")),
                 "authorized": bool(creds.get("refresh_token")),
                 "scope": creds.get("scope", ""),
                 "musixmatch_configured": bool(creds.get("musixmatch_api_key")),
+                "sp_dc_configured": bool(creds.get("sp_dc")),
             }
             print_result(info, True)
             return 0
 
+        if args.command == "cookie-login":
+            from browser_login import fetch_and_store_sp_dc
+            print_result(fetch_and_store_sp_dc(), True)
+            return 0
+
         if args.command == "auth":
+            if backend == "cookie":
+                print("cookie 模式不需要 OAuth 授权：把 open.spotify.com 的 "
+                      "sp_dc cookie 填入凭据文件的 sp_dc 字段即可"
+                      "（获取方法见 README 的「cookie 模式」一节），"
+                      "或运行 spotify.py cookie-login 用自带无头浏览器登录获取。")
+                return 0
             run_auth_flow()
             print("授权完成，令牌已写入凭据文件。")
             return 0
@@ -352,6 +424,11 @@ def main() -> int:
                 print_result(report, True)
             else:
                 print(format_report_text(report))
+            return 0
+
+        if backend == "cookie":
+            result = run_cookie_command(args)
+            print_result(result, True)
             return 0
 
         client = SpotifyClient()

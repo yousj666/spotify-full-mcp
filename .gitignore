@@ -1,0 +1,16 @@
+# 凭证与令牌：永远不要提交
+credentials.json
+*.credentials.json
+tokens.json
+*.token
+.env
+.env.*
+
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+
+# 系统杂项
+.DS_Store
